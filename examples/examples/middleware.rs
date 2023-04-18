@@ -74,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
 		let _ = client.request::<String, _>("say_hello", rpc_params![]).await?;
 	}
 
+	while (true) {}
 	Ok(())
 }
 

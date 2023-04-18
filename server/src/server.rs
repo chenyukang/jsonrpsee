@@ -34,13 +34,17 @@ use std::time::Duration;
 
 use crate::future::{ConnectionGuard, ServerHandle, StopHandle};
 use crate::logger::{Logger, TransportProtocol};
+use crate::stream::stream_codec::{Separator, StreamCodec};
+use crate::stream::suspendable_stream::SuspendableStream;
 use crate::transport::{http, ws};
+use std::io;
 
 use futures_util::future::{Either, FutureExt};
 use futures_util::io::{BufReader, BufWriter};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use hyper::body::HttpBody;
+use hyper::client::connect;
 use jsonrpsee_core::id_providers::RandomIntegerIdProvider;
 
 use jsonrpsee_core::server::{AllowHosts, Methods};
@@ -50,7 +54,13 @@ use jsonrpsee_core::{http_helpers, Error, TEN_MB_SIZE_BYTES};
 use soketto::handshake::http::is_upgrade_request;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{watch, OwnedSemaphorePermit};
+use tokio_stream::wrappers::TcpListenerStream;
+
+use crate::stream::dispatch::{Dispatcher, PeerMessageQueue, SenderChannels};
+use tokio_util::codec::Framed;
 use tokio_util::compat::TokioAsyncReadCompatExt;
+
+use futures::future;
 use tower::layer::util::Identity;
 use tower::{Layer, Service};
 use tracing::{instrument, Instrument};
@@ -154,6 +164,7 @@ where
 						max_connections: self.cfg.max_connections,
 						enable_http: self.cfg.enable_http,
 						enable_ws: self.cfg.enable_ws,
+						enable_tcp: self.cfg.enable_tcp,
 						message_buffer_capacity: self.cfg.message_buffer_capacity,
 					};
 					process_connection(&self.service_builder, &connection_guard, data, socket, &mut connections);
@@ -203,6 +214,8 @@ struct Settings {
 	enable_http: bool,
 	/// Enable WS.
 	enable_ws: bool,
+	/// Enable TCP.
+	enable_tcp: bool,
 	/// Number of messages that server is allowed to `buffer` until backpressure kicks in.
 	message_buffer_capacity: u32,
 }
@@ -231,6 +244,7 @@ impl Default for Settings {
 			ping_interval: Duration::from_secs(60),
 			enable_http: true,
 			enable_ws: true,
+			enable_tcp: true,
 			message_buffer_capacity: 1024,
 		}
 	}
@@ -585,6 +599,8 @@ pub(crate) struct ServiceData<L: Logger> {
 	pub(crate) enable_http: bool,
 	/// Enable WS.
 	pub(crate) enable_ws: bool,
+	/// Enable TCP.
+	pub(crate) enable_tcp: bool,
 	/// Number of messages that server is allowed `buffer` until backpressure kicks in.
 	pub(crate) message_buffer_capacity: u32,
 }
@@ -725,6 +741,8 @@ struct ProcessConnection<L> {
 	enable_http: bool,
 	/// Allow JSON-RPC WS request and WS upgrade requests.
 	enable_ws: bool,
+	/// Allow TCP requests.
+	enable_tcp: bool,
 	/// Number of messages that server is allowed `buffer` until backpressure kicks in.
 	message_buffer_capacity: u32,
 }
@@ -785,13 +803,75 @@ fn process_connection<'a, L: Logger, B, U>(
 			conn: Arc::new(conn),
 			enable_http: cfg.enable_http,
 			enable_ws: cfg.enable_ws,
+			enable_tcp: cfg.enable_tcp,
 			message_buffer_capacity: cfg.message_buffer_capacity,
 		},
 	};
 
 	let service = service_builder.service(tower_service);
 
-	connections.push(tokio::spawn(to_http_service(socket, service, cfg.stop_handle).in_current_span()));
+	let fut = if cfg.enable_tcp {
+		tokio::spawn(to_http_service(socket, service, cfg.stop_handle).in_current_span())
+	} else {
+		tokio::spawn(to_tcp_service(socket, service, cfg.stop_handle))
+	};
+	connections.push(fut);
+}
+
+async fn to_tcp_service<S, B>(socket: TcpStream, service: S, stop_handle: StopHandle)
+where
+	S: Service<hyper::Request<hyper::Body>, Response = hyper::Response<B>> + Send + 'static,
+	S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+	S::Future: Send,
+	B: HttpBody + Send + 'static,
+	<B as HttpBody>::Error: Send + Sync + StdError,
+	<B as HttpBody>::Data: Send,
+{
+	use futures::{FutureExt, SinkExt, StreamExt, TryStreamExt};
+	tokio::spawn(async move {
+		let start = async {
+			let listener = tokio::net::TcpListener::bind(&socket.peer_addr().unwrap()).await?;
+			let listener = TcpListenerStream::new(listener);
+			let stream = SuspendableStream::new(listener);
+			let server = stream.map(|tcp_stream| {
+				let peer_addr = tcp_stream.peer_addr().unwrap();
+				let (sender, receiver) = futures::channel::mpsc::unbounded();
+				let incoming_separator: Separator = Default::default();
+				let outgoing_separator: Separator = Default::default();
+				let (mut writer, reader) =
+					Framed::new(tcp_stream, StreamCodec::new(incoming_separator.clone(), outgoing_separator.clone()))
+						.split();
+				// Work around https://github.com/rust-lang/rust/issues/64552 by boxing the stream type
+				let responses: Pin<Box<dyn futures::Stream<Item = io::Result<String>> + Send>> =
+					Box::pin(reader.and_then(move |req| {
+						service.call(req).then(|response| match response {
+							Err(e) => future::ok(String::new()),
+							Ok(None) => future::ok(String::new()),
+							Ok(Some(response_data)) => future::ok(response_data),
+						})
+					}));
+
+				let channels: Arc<SenderChannels> = Default::default();
+				let mut peer_message_queue = {
+					let mut channels = channels.lock();
+					channels.insert(peer_addr, sender);
+
+					PeerMessageQueue::new(responses, receiver, peer_addr)
+				};
+
+				let shared_channels = channels.clone();
+				let writer = async move {
+					writer.send_all(&mut peer_message_queue).await?;
+					let mut channels = shared_channels.lock();
+					channels.remove(&peer_addr);
+					Ok(())
+				};
+
+				Either::Right(writer)
+			});
+			Ok(server)
+		};
+	})
 }
 
 // Attempts to create a HTTP connection from a socket.

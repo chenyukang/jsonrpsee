@@ -78,6 +78,8 @@ async fn main() -> anyhow::Result<()> {
 	println!("[main]: Interpret proxy response: {:?}", out);
 	assert_eq!(out.as_str(), "{\"health\":true}");
 
+	while (true) {}
+
 	Ok(())
 }
 
@@ -86,10 +88,10 @@ async fn run_server() -> anyhow::Result<SocketAddr> {
 	let service_builder = tower::ServiceBuilder::new()
 		// Proxy `GET /health` requests to internal `system_health` method.
 		.layer(ProxyGetRequestLayer::new("/health", "system_health")?)
-		.timeout(Duration::from_secs(2));
+		.timeout(Duration::from_secs(10));
 
 	let server =
-		ServerBuilder::new().set_middleware(service_builder).build("127.0.0.1:0".parse::<SocketAddr>()?).await?;
+		ServerBuilder::new().set_middleware(service_builder).build("127.0.0.1:8001".parse::<SocketAddr>()?).await?;
 
 	let addr = server.local_addr()?;
 
@@ -103,5 +105,6 @@ async fn run_server() -> anyhow::Result<SocketAddr> {
 	// You may use the `ServerHandle` to shut it down or manage it yourself.
 	tokio::spawn(handle.stopped());
 
+	println!("now..........");
 	Ok(addr)
 }

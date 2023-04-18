@@ -33,6 +33,7 @@
 
 mod future;
 mod server;
+mod stream;
 mod transport;
 
 pub mod logger;
