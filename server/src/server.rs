@@ -44,7 +44,6 @@ use futures_util::io::{BufReader, BufWriter};
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use hyper::body::HttpBody;
-use hyper::client::connect;
 use jsonrpsee_core::id_providers::RandomIntegerIdProvider;
 
 use jsonrpsee_core::server::{AllowHosts, Methods};
@@ -56,10 +55,11 @@ use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio::sync::{watch, OwnedSemaphorePermit};
 use tokio_stream::wrappers::TcpListenerStream;
 
-use crate::stream::dispatch::{Dispatcher, PeerMessageQueue, SenderChannels};
+use crate::stream::dispatch::{PeerMessageQueue, SenderChannels};
 use tokio_util::codec::Framed;
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
+use crate::types::Request;
 use futures::future;
 use tower::layer::util::Identity;
 use tower::{Layer, Service};
@@ -827,7 +827,7 @@ where
 	<B as HttpBody>::Error: Send + Sync + StdError,
 	<B as HttpBody>::Data: Send,
 {
-	use futures::{FutureExt, SinkExt, StreamExt, TryStreamExt};
+	use futures::{SinkExt, TryStreamExt};
 	tokio::spawn(async move {
 		let start = async {
 			let listener = tokio::net::TcpListener::bind(&socket.peer_addr().unwrap()).await?;
@@ -844,6 +844,7 @@ where
 				// Work around https://github.com/rust-lang/rust/issues/64552 by boxing the stream type
 				let responses: Pin<Box<dyn futures::Stream<Item = io::Result<String>> + Send>> =
 					Box::pin(reader.and_then(move |req| {
+						let req = serde_json::from_slice::<Request>(&req.as_bytes()).unwrap();
 						service.call(req).then(|response| match response {
 							Err(e) => future::ok(String::new()),
 							Ok(None) => future::ok(String::new()),
